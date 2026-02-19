@@ -13,6 +13,9 @@ import fileRoutes from './routes/files.js';
 import memoryRoutes from './routes/memories.js';
 import connectionRoutes from './routes/connections.js';
 import draftRoutes from './routes/drafts.js';
+import searchRoutes from './routes/search.js';
+import agentRunRoutes from './routes/agent-runs.js';
+import reactionRoutes from './routes/reactions.js';
 import webhookRoutes from './connectors/github/webhooks.js';
 import { addConnection, removeConnection } from './lib/websocket.js';
 import { ensureBucket } from './lib/file-store.js';
@@ -33,7 +36,6 @@ app.use('*', logger());
 
 // Auth middleware — skip for public routes
 app.use('/api/*', async (c, next) => {
-  // Skip auth for public endpoints
   const path = c.req.path;
   if (path === '/api/health' || 
       path === '/api/auth/login' || 
@@ -67,6 +69,9 @@ app.route('/api/files', fileRoutes);
 app.route('/api/memories', memoryRoutes);
 app.route('/api/connections', connectionRoutes);
 app.route('/api/drafts', draftRoutes);
+app.route('/api/search', searchRoutes);
+app.route('/api/agent/runs', agentRunRoutes);
+app.route('/api/messages', reactionRoutes);
 app.route('/api/webhooks', webhookRoutes);
 
 // ─── WebSocket ────────────────────────────────────────────
@@ -81,7 +86,6 @@ app.get('/api/ws', upgradeWebSocket((c) => {
       try {
         const data = JSON.parse(evt.data.toString());
 
-        // Auth message
         if (data.type === 'auth' && data.token) {
           import('./lib/auth.js').then(({ verifyToken }) => {
             verifyToken(data.token).then((payload) => {
@@ -112,15 +116,28 @@ app.get('/api/ws', upgradeWebSocket((c) => {
           };
 
           runConductor(signal).then((result) => {
-            ws.send(JSON.stringify({
-              type: 'response',
-              payload: result,
-            }));
+            ws.send(JSON.stringify({ type: 'response', payload: result }));
           }).catch((e) => {
-            ws.send(JSON.stringify({
-              type: 'error',
-              message: (e as Error).message,
-            }));
+            ws.send(JSON.stringify({ type: 'error', message: (e as Error).message }));
+          });
+          return;
+        }
+
+        // File attachment message
+        if (data.type === 'file_message' && data.fileId) {
+          const signal: Signal = {
+            type: 'chat_message',
+            userId,
+            cellId: data.cellId,
+            conversationId: data.conversationId,
+            content: data.content || `[File uploaded: ${data.filename}]`,
+            metadata: { fileId: data.fileId, filename: data.filename },
+          };
+
+          runConductor(signal).then((result) => {
+            ws.send(JSON.stringify({ type: 'response', payload: result }));
+          }).catch((e) => {
+            ws.send(JSON.stringify({ type: 'error', message: (e as Error).message }));
           });
           return;
         }
@@ -141,24 +158,19 @@ app.get('/api/ws', upgradeWebSocket((c) => {
 const PORT = parseInt(process.env.PORT || '3001');
 
 async function start() {
-  // Initialize file storage
   await ensureBucket();
-
-  // Initialize agent skills (GitHub tools, etc.)
   initializeSkills();
-
-  // Initialize task scheduler (BullMQ workers)
   initializeScheduler();
-
-  // Restore scheduled cron tasks
   await restoreScheduledTasks();
 
   const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
     console.log(`\n🧠 SureThing Clone server running on http://localhost:${info.port}`);
-    console.log('   Agent core: ✅ Conductor + Tools + Memory');
-    console.log('   GitHub:     ✅ 12 tools registered');
-    console.log('   Scheduler:  ✅ BullMQ workers active');
-    console.log('   WebSocket:  ✅ Real-time chat ready\n');
+    console.log('   Agent core:  ✅ Conductor + Tools + Memory + Activity Logging');
+    console.log('   GitHub:      ✅ 19 tools registered (12 base + 7 extended)');
+    console.log('   Scheduler:   ✅ BullMQ workers + heartbeat + recurring task protection');
+    console.log('   Files:       ✅ MinIO + signed URLs + AI analysis pipeline');
+    console.log('   Search:      ✅ Semantic search via pgvector');
+    console.log('   WebSocket:   ✅ Real-time chat + file attachments ready\n');
   });
 
   injectWebSocket(server);
