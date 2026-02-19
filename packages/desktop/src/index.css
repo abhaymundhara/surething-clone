@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+
+/* Chat markdown */
+.prose pre { background: #1e1e2e; border-radius: 8px; padding: 12px; overflow-x: auto; }
+.prose code { font-size: 0.875rem; }
+.prose p { margin: 0.25em 0; }
