@@ -1,5 +1,5 @@
 import { db } from '../db/index.js';
-import { messages, conversations, cells, tasks, connections, cellState } from '../db/schema.js';
+import { messages, conversations, cells, tasks, connections, cellState, users } from '../db/schema.js';
 import { eq, desc, and } from 'drizzle-orm';
 import { chat, type LLMMessage } from '../lib/llm.js';
 import { buildSystemPrompt, type PromptContext } from './prompt.js';
@@ -7,7 +7,8 @@ import { getToolDefs, executeTool, type ToolContext } from './tools.js';
 import { embedMessage } from '../lib/embeddings.js';
 import { compressCellState } from './memory.js';
 import { broadcast } from '../lib/websocket.js';
-import { users } from '../db/schema.js';
+import { logAgentAction } from '../services/agent-log.js';
+import { CitationTracker } from './citations.js';
 
 // ═══════════════════════════════════════════════════════
 // CONDUCTOR — Central Agent Orchestrator
@@ -28,21 +29,28 @@ export interface ConductorResult {
   cellId: string;
   conversationId: string;
   toolsUsed: string[];
+  citations: { index: number; type: string; name: string; url?: string }[];
 }
 
-const MAX_TOOL_ROUNDS = 5; // Max iterations of tool calling
-const MAX_HISTORY = 20;    // Max messages in context
+const MAX_TOOL_ROUNDS = 5;
+const MAX_HISTORY = 20;
 
 export async function runConductor(signal: Signal): Promise<ConductorResult> {
-  console.log(`[Conductor] Processing ${signal.type} signal from user ${signal.userId}`);
+  const batchId = crypto.randomUUID();
+  console.log(`[Conductor] Processing ${signal.type} signal from user ${signal.userId} (batch: ${batchId.substring(0, 8)})`);
   const toolsUsed: string[] = [];
+  const citations = new CitationTracker();
+
+  await logAgentAction(signal.userId, signal.cellId || null, 'chat_response', {
+    signalType: signal.type,
+    contentPreview: signal.content?.substring(0, 100),
+  }, batchId);
 
   // ─── Step 1: Resolve Cell & Conversation ─────────
   let cellId = signal.cellId;
   let conversationId = signal.conversationId;
 
   if (!cellId) {
-    // Create or find a default cell for this user
     const existing = await db.select().from(cells)
       .where(and(eq(cells.userId, signal.userId), eq(cells.status, 'active')))
       .orderBy(desc(cells.lastSeenAt))
@@ -60,11 +68,9 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
     }
   }
 
-  // Update cell last seen
   await db.update(cells).set({ lastSeenAt: new Date() }).where(eq(cells.id, cellId));
 
   if (!conversationId) {
-    // Create or find conversation for this cell
     const existing = await db.select().from(conversations)
       .where(and(eq(conversations.cellId, cellId), eq(conversations.userId, signal.userId)))
       .orderBy(desc(conversations.createdAt))
@@ -87,11 +93,10 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
       conversationId,
       role: 'user',
       content: signal.content,
+      metadata: signal.metadata || null,
     }).returning();
 
     broadcast(signal.userId, { type: 'message', payload: userMsg });
-
-    // Embed asynchronously (don't block)
     embedMessage(userMsg.id, signal.content).catch(() => {});
   }
 
@@ -139,7 +144,6 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
     })),
   ];
 
-  // If this is a timer/heartbeat signal, add a system message
   if (signal.type === 'timer' || signal.type === 'heartbeat') {
     llmMessages.push({
       role: 'user',
@@ -155,12 +159,10 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
     const result = await chat(llmMessages, { temperature: 0.7 }, toolDefs);
 
     if (result.toolCalls.length === 0) {
-      // No more tool calls — this is the final response
       finalResponse = result.content;
       break;
     }
 
-    // Execute tool calls
     llmMessages.push({ role: 'assistant', content: result.content || '' });
 
     for (const toolCall of result.toolCalls) {
@@ -169,14 +171,20 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
 
       const toolResult = await executeTool(toolCall, toolCtx);
 
-      // Add tool result as user message (Ollama format)
+      // Track citation for each tool result
+      citations.add('tool_result', toolCall.name, undefined, JSON.stringify(toolResult).substring(0, 200));
+
+      await logAgentAction(signal.userId, cellId, 'tool_execution', {
+        tool: toolCall.name,
+        argsPreview: JSON.stringify(toolCall.arguments).substring(0, 200),
+      }, batchId);
+
       llmMessages.push({
         role: 'user',
         content: `[Tool result for ${toolCall.name}]: ${JSON.stringify(toolResult)}`,
       });
     }
 
-    // If this is the last round, get final response
     if (round === MAX_TOOL_ROUNDS - 1) {
       const final = await chat(llmMessages, { temperature: 0.7 });
       finalResponse = final.content;
@@ -189,19 +197,28 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
       conversationId,
       role: 'assistant',
       content: finalResponse,
+      metadata: {
+        toolsUsed,
+        citations: citations.toJSON(),
+      },
     }).returning();
 
-    broadcast(signal.userId, { type: 'message', payload: aiMsg });
+    broadcast(signal.userId, {
+      type: 'message',
+      payload: { ...aiMsg, citations: citations.toJSON() },
+    });
     embedMessage(aiMsg.id, finalResponse).catch(() => {});
   }
 
   // ─── Step 6: Background Compression ──────────────
-  // Compress state after every 10 messages (async, don't block)
   const msgCount = history.length;
   if (msgCount > 0 && msgCount % 10 === 0) {
     compressCellState(cellId, conversationId).catch(e => {
       console.warn('[Conductor] Background compression failed:', (e as Error).message);
     });
+    await logAgentAction(signal.userId, cellId, 'memory_compressed', {
+      messageCount: msgCount,
+    }, batchId);
   }
 
   return {
@@ -209,5 +226,6 @@ export async function runConductor(signal: Signal): Promise<ConductorResult> {
     cellId,
     conversationId,
     toolsUsed,
+    citations: citations.toJSON(),
   };
 }
