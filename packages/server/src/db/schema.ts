@@ -1,6 +1,19 @@
 import {
-  pgTable, uuid, varchar, text, timestamp, boolean, integer, bigint, jsonb, index,
+  pgTable, uuid, varchar, text, timestamp, boolean, integer, bigint, jsonb, index, customType,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+
+// ─── Custom pgvector type ──────────────────────────────
+const vector = customType<{ data: number[]; dpiType: string }>({
+  dataType() { return 'vector(768)'; },
+  fromDriver(value: unknown) { 
+    if (typeof value === 'string') {
+      return value.replace(/[\[\]]/g, '').split(',').map(Number);
+    }
+    return value as number[];
+  },
+  toDriver(value: number[]) { return `[${value.join(',')}]`; },
+});
 
 // ─── Users ───────────────────────────────────────────────
 export const users = pgTable('users', {
@@ -31,7 +44,7 @@ export const cells = pgTable('cells', {
 export const cellState = pgTable('cell_state', {
   id: uuid('id').primaryKey().defaultRandom(),
   cellId: uuid('cell_id').references(() => cells.id, { onDelete: 'cascade' }).notNull(),
-  layer: varchar('layer', { length: 5 }).notNull(), // L2, L3, L5, L6
+  layer: varchar('layer', { length: 20 }).notNull(),
   content: text('content').notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
@@ -52,7 +65,7 @@ export const conversations = pgTable('conversations', {
 export const messages = pgTable('messages', {
   id: uuid('id').primaryKey().defaultRandom(),
   conversationId: uuid('conversation_id').references(() => conversations.id, { onDelete: 'cascade' }).notNull(),
-  role: varchar('role', { length: 20 }).notNull(), // user, assistant, system
+  role: varchar('role', { length: 20 }).notNull(),
   content: text('content').notNull(),
   metadata: jsonb('metadata'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -67,23 +80,21 @@ export const tasks = pgTable('tasks', {
   cellId: uuid('cell_id').references(() => cells.id, { onDelete: 'cascade' }).notNull(),
   conversationId: uuid('conversation_id').references(() => conversations.id),
   title: varchar('title', { length: 500 }).notNull(),
-  executor: varchar('executor', { length: 10 }).notNull(), // ai, human
+  executor: varchar('executor', { length: 10 }).notNull(),
   status: varchar('status', { length: 30 }).default('pending').notNull(),
   action: text('action'),
   actionContext: jsonb('action_context'),
   triggerType: varchar('trigger_type', { length: 20 }),
   triggerConfig: jsonb('trigger_config'),
   whyHuman: text('why_human'),
-  reason: text('reason'), // For skipped tasks
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   completedAt: timestamp('completed_at', { withTimezone: true }),
 }, (table) => [
   index('idx_tasks_cell_id').on(table.cellId),
   index('idx_tasks_status').on(table.status),
-  index('idx_tasks_executor').on(table.executor),
 ]);
 
-// ─── Task Runs (execution history for recurring tasks) ───
+// ─── Task Runs ───────────────────────────────────────────
 export const taskRuns = pgTable('task_runs', {
   id: uuid('id').primaryKey().defaultRandom(),
   taskId: uuid('task_id').references(() => tasks.id, { onDelete: 'cascade' }).notNull(),
@@ -98,13 +109,12 @@ export const taskRuns = pgTable('task_runs', {
 // ─── User Memories ───────────────────────────────────────
 export const userMemories = pgTable('user_memories', {
   id: uuid('id').primaryKey().defaultRandom(),
-  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
   category: varchar('category', { length: 20 }).notNull(),
   content: text('content').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   index('idx_user_memories_user_id').on(table.userId),
-  index('idx_user_memories_category').on(table.category),
 ]);
 
 // ─── Drafts ──────────────────────────────────────────────
@@ -116,10 +126,7 @@ export const drafts = pgTable('drafts', {
   content: jsonb('content').notNull(),
   status: varchar('status', { length: 20 }).default('pending').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-}, (table) => [
-  index('idx_drafts_cell_id').on(table.cellId),
-  index('idx_drafts_status').on(table.status),
-]);
+});
 
 // ─── Uploaded Files ──────────────────────────────────────
 export const uploadedFiles = pgTable('uploaded_files', {
@@ -131,15 +138,12 @@ export const uploadedFiles = pgTable('uploaded_files', {
   sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
   storageKey: varchar('storage_key', { length: 500 }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-}, (table) => [
-  index('idx_uploaded_files_user_id').on(table.userId),
-  index('idx_uploaded_files_cell_id').on(table.cellId),
-]);
+});
 
 // ─── Connections (GitHub OAuth) ──────────────────────────
 export const connections = pgTable('connections', {
   id: uuid('id').primaryKey().defaultRandom(),
-  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
   provider: varchar('provider', { length: 50 }).notNull(),
   accessToken: text('access_token').notNull(),
   refreshToken: text('refresh_token'),
@@ -151,29 +155,12 @@ export const connections = pgTable('connections', {
   index('idx_connections_user_provider').on(table.userId, table.provider),
 ]);
 
-// ─── Heartbeat Rules ─────────────────────────────────────
-export const heartbeatRules = pgTable('heartbeat_rules', {
+// ─── Message Embeddings (pgvector) ───────────────────────
+export const messageEmbeddings = pgTable('message_embeddings', {
   id: uuid('id').primaryKey().defaultRandom(),
-  cellId: uuid('cell_id').references(() => cells.id, { onDelete: 'cascade' }).notNull(),
-  ruleId: varchar('rule_id', { length: 100 }).notNull(),
-  cron: varchar('cron', { length: 100 }).notNull(),
-  enabled: boolean('enabled').default(true).notNull(),
-  checklist: jsonb('checklist').notNull(), // string[]
-  lastRunAt: timestamp('last_run_at', { withTimezone: true }),
+  messageId: uuid('message_id').references(() => messages.id, { onDelete: 'cascade' }).notNull(),
+  embedding: vector('embedding'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
-  index('idx_heartbeat_rules_cell_id').on(table.cellId),
-]);
-
-// ─── Agent Runs (activity log) ───────────────────────────
-export const agentRuns = pgTable('agent_runs', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  cellId: uuid('cell_id').references(() => cells.id),
-  action: varchar('action', { length: 50 }).notNull(),
-  batchId: varchar('batch_id', { length: 100 }),
-  metadata: jsonb('metadata'),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-}, (table) => [
-  index('idx_agent_runs_action').on(table.action),
-  index('idx_agent_runs_created_at').on(table.createdAt),
+  index('idx_message_embeddings_message_id').on(table.messageId),
 ]);

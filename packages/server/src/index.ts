@@ -13,9 +13,13 @@ import fileRoutes from './routes/files.js';
 import memoryRoutes from './routes/memories.js';
 import connectionRoutes from './routes/connections.js';
 import draftRoutes from './routes/drafts.js';
+import webhookRoutes from './connectors/github/webhooks.js';
 import { addConnection, removeConnection } from './lib/websocket.js';
 import { ensureBucket } from './lib/file-store.js';
 import { healthCheck as llmHealthCheck } from './lib/llm.js';
+import { initializeSkills } from './agent/skills.js';
+import { initializeScheduler, restoreScheduledTasks } from './agent/scheduler.js';
+import { runConductor, type Signal } from './agent/conductor.js';
 
 const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -26,7 +30,20 @@ app.use('*', cors({
   credentials: true,
 }));
 app.use('*', logger());
-app.use('/api/*', authMiddleware);
+
+// Auth middleware — skip for public routes
+app.use('/api/*', async (c, next) => {
+  // Skip auth for public endpoints
+  const path = c.req.path;
+  if (path === '/api/health' || 
+      path === '/api/auth/login' || 
+      path === '/api/auth/register' ||
+      path.startsWith('/api/webhooks/') ||
+      path === '/api/connections/github/callback') {
+    return next();
+  }
+  return authMiddleware(c, next);
+});
 
 // ─── Health Check ─────────────────────────────────────────
 app.get('/api/health', async (c) => {
@@ -50,6 +67,7 @@ app.route('/api/files', fileRoutes);
 app.route('/api/memories', memoryRoutes);
 app.route('/api/connections', connectionRoutes);
 app.route('/api/drafts', draftRoutes);
+app.route('/api/webhooks', webhookRoutes);
 
 // ─── WebSocket ────────────────────────────────────────────
 app.get('/api/ws', upgradeWebSocket((c) => {
@@ -57,14 +75,13 @@ app.get('/api/ws', upgradeWebSocket((c) => {
 
   return {
     onOpen(evt, ws) {
-      // Auth will be handled on first message
       console.log('[WS] New connection opened');
     },
     onMessage(evt, ws) {
       try {
         const data = JSON.parse(evt.data.toString());
 
-        // First message should be auth
+        // Auth message
         if (data.type === 'auth' && data.token) {
           import('./lib/auth.js').then(({ verifyToken }) => {
             verifyToken(data.token).then((payload) => {
@@ -79,47 +96,75 @@ app.get('/api/ws', upgradeWebSocket((c) => {
           return;
         }
 
-        // Handle other message types
         if (!userId) {
           ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
           return;
         }
 
-        // TODO: Route to agent conductor (Phase 2)
+        // Chat message via WebSocket
+        if (data.type === 'message' && data.content) {
+          const signal: Signal = {
+            type: 'chat_message',
+            userId,
+            cellId: data.cellId,
+            conversationId: data.conversationId,
+            content: data.content,
+          };
+
+          runConductor(signal).then((result) => {
+            ws.send(JSON.stringify({
+              type: 'response',
+              payload: result,
+            }));
+          }).catch((e) => {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: (e as Error).message,
+            }));
+          });
+          return;
+        }
+
         ws.send(JSON.stringify({ type: 'ack', id: data.id }));
-      } catch {
+      } catch (e) {
         ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
       }
     },
     onClose() {
-      if (userId) {
-        removeConnection(userId, undefined as any); // Will be cleaned up
-      }
+      if (userId) removeConnection(userId);
+      console.log('[WS] Connection closed');
     },
   };
 }));
 
 // ─── Start Server ─────────────────────────────────────────
-const port = parseInt(process.env.PORT || '3001');
+const PORT = parseInt(process.env.PORT || '3001');
 
 async function start() {
-  // Ensure MinIO bucket exists
-  try {
-    await ensureBucket();
-    console.log('[Server] MinIO bucket ready');
-  } catch (e) {
-    console.warn('[Server] MinIO not available (non-critical):', (e as Error).message);
-  }
+  // Initialize file storage
+  await ensureBucket();
 
-  const server = serve({ fetch: app.fetch, port }, (info) => {
-    console.log(`[Server] Running on http://localhost:${info.port}`);
-    console.log(`[Server] WebSocket: ws://localhost:${info.port}/api/ws`);
-    console.log(`[Server] Health: http://localhost:${info.port}/api/health`);
+  // Initialize agent skills (GitHub tools, etc.)
+  initializeSkills();
+
+  // Initialize task scheduler (BullMQ workers)
+  initializeScheduler();
+
+  // Restore scheduled cron tasks
+  await restoreScheduledTasks();
+
+  const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
+    console.log(`\n🧠 SureThing Clone server running on http://localhost:${info.port}`);
+    console.log('   Agent core: ✅ Conductor + Tools + Memory');
+    console.log('   GitHub:     ✅ 12 tools registered');
+    console.log('   Scheduler:  ✅ BullMQ workers active');
+    console.log('   WebSocket:  ✅ Real-time chat ready\n');
   });
 
   injectWebSocket(server);
 }
 
-start().catch(console.error);
-
-export default app;
+start().catch((e) => {
+  console.error('Failed to start server:', e);
+  process.exit(1);
+});

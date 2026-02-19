@@ -26,6 +26,7 @@
     "ollama": "^0.5.0",
     "pg": "^8.13.0",
     "postgres": "^3.4.0",
+    "yaml": "^2.6.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
