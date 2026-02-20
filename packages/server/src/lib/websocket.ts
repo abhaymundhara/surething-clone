@@ -1,40 +1,39 @@
 import type { WSContext } from 'hono/ws';
 
-// In-memory WebSocket connection store (single-user system)
+// In-memory WebSocket connection store
+// Map<userId, Set<WSContext>>
 const connections = new Map<string, Set<WSContext>>();
 
-export function addConnection(userId: string, ws: WSContext): void {
+export function addConnection(userId: string, ws: WSContext) {
   if (!connections.has(userId)) {
     connections.set(userId, new Set());
   }
   connections.get(userId)!.add(ws);
-  console.log(`[WS] Connected: ${userId} (${connections.get(userId)!.size} total)`);
 }
 
-export function removeConnection(userId: string, ws: WSContext): void {
-  const conns = connections.get(userId);
-  if (conns) {
-    conns.delete(ws);
-    if (conns.size === 0) connections.delete(userId);
-  }
-  console.log(`[WS] Disconnected: ${userId}`);
-}
-
-export function broadcast(userId: string, event: { type: string; payload: unknown }): void {
-  const conns = connections.get(userId);
-  if (!conns) return;
-  const message = JSON.stringify(event);
-  for (const ws of conns) {
-    try {
-      ws.send(message);
-    } catch {
-      conns.delete(ws);
+export function removeConnection(userId: string, ws: WSContext) {
+  const userConns = connections.get(userId);
+  if (userConns) {
+    userConns.delete(ws);
+    if (userConns.size === 0) {
+      connections.delete(userId);
     }
   }
 }
 
-export function broadcastAll(event: { type: string; payload: unknown }): void {
-  for (const [userId] of connections) {
-    broadcast(userId, event);
+export function broadcast(userId: string, data: unknown) {
+  const userConns = connections.get(userId);
+  if (!userConns) return;
+  const payload = JSON.stringify(data);
+  for (const ws of userConns) {
+    try {
+      ws.send(payload);
+    } catch {
+      userConns.delete(ws);
+    }
   }
+}
+
+export function getConnectionCount(userId: string): number {
+  return connections.get(userId)?.size ?? 0;
 }

@@ -1,100 +1,101 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useStore } from '../lib/store';
 import { api } from '../lib/api';
-import { connectWebSocket } from '../lib/websocket';
 import MessageBubble from '../components/MessageBubble';
 import ApprovalCard from '../components/ApprovalCard';
-import Toast from '../components/Toast';
+import { Send, Paperclip, Plus, MessageSquarePlus } from 'lucide-react';
 
 export default function Chat() {
-  const { messages, setMessages, tasks, setTasks, currentConversationId, setCurrentConversation } = useStore();
   const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [conversations, setConversations] = useState<any[]>([]);
-  const [showConvList, setShowConvList] = useState(false);
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [sending, setSending] = useState(false);
   const [dragActive, setDragActive] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  const {
+    messages, setMessages, addMessage,
+    conversations, setConversations,
+    currentConversationId, currentCellId, setCurrentConversation,
+    tasks, addToast,
+  } = useStore();
+
+  // Load conversations on mount
   useEffect(() => {
-    connectWebSocket();
-    loadConversations();
-    inputRef.current?.focus();
+    api.getConversations()
+      .then(convs => {
+        setConversations(convs);
+        if (convs.length > 0 && !currentConversationId) {
+          setCurrentConversation(convs[0].id, convs[0].cellId);
+        }
+      })
+      .catch(() => addToast('Failed to load conversations', 'error'));
   }, []);
 
+  // Load messages when conversation changes
   useEffect(() => {
-    if (currentConversationId) {
-      loadMessages();
-      loadTasks();
+    if (!currentConversationId) {
+      setMessages([]);
+      return;
     }
+    api.getMessages(currentConversationId)
+      .then(msgs => setMessages(msgs))
+      .catch(() => addToast('Failed to load messages', 'error'));
   }, [currentConversationId]);
 
+  // Auto-scroll to bottom
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const loadConversations = async () => {
-    try {
-      const data = await api.getConversations();
-      setConversations(data);
-      if (data.length > 0 && !currentConversationId) {
-        setCurrentConversation(data[0].id, data[0].cellId);
-      }
-    } catch (e) { showToast((e as Error).message, 'error'); }
-  };
-
-  const loadMessages = async () => {
-    if (!currentConversationId) return;
-    try {
-      const data = await api.getMessages(currentConversationId);
-      setMessages(data);
-    } catch (e) { showToast((e as Error).message, 'error'); }
-  };
-
-  const loadTasks = async () => {
-    try { setTasks(await api.getTasks()); } catch (e) { console.error(e); }
-  };
-
-  const showToast = (message: string, type: 'success' | 'error') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 3000);
-  };
+  // Focus input
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, [currentConversationId]);
 
   const handleSend = async () => {
-    if (!input.trim() || loading) return;
+    const text = input.trim();
+    if (!text || sending) return;
+
     let convId = currentConversationId;
 
+    // Create new conversation if none selected
     if (!convId) {
-      const { conversation, cellId } = await api.createConversation('New Chat');
-      convId = conversation.id;
-      setCurrentConversation(conversation.id, cellId);
-      await loadConversations();
+      try {
+        const conv = await api.createConversation();
+        convId = conv.id;
+        setCurrentConversation(conv.id, conv.cellId ?? null);
+        setConversations([conv, ...conversations]);
+      } catch {
+        addToast('Failed to create conversation', 'error');
+        return;
+      }
     }
 
-    const content = input.trim();
     setInput('');
-    setLoading(true);
+    setSending(true);
 
     // Optimistic message
-    const optimisticMsg = {
+    const tempMsg = {
       id: `temp-${Date.now()}`,
-      conversationId: convId!,
+      conversationId: convId,
       role: 'user' as const,
-      content,
+      content: text,
       createdAt: new Date().toISOString(),
     };
-    useStore.getState().addMessage(optimisticMsg);
+    addMessage(tempMsg);
 
     try {
-      await api.sendMessage(convId!, content);
-      await loadMessages();
-    } catch (e) {
-      showToast((e as Error).message, 'error');
+      const response = await api.sendMessage(convId, text);
+      // Server returns the saved message; the WS handler will also push it
+      // The store's addMessage deduplicates by removing temp messages
+    } catch (err: any) {
+      addToast(err.message || 'Failed to send message', 'error');
+      // Remove the optimistic message on error
+      useStore.getState().setMessages(
+        useStore.getState().messages.filter(m => m.id !== tempMsg.id)
+      );
     } finally {
-      setLoading(false);
-      inputRef.current?.focus();
+      setSending(false);
     }
   };
 
@@ -105,139 +106,147 @@ export default function Chat() {
     }
   };
 
-  const handleFileUpload = async (file: File) => {
+  const handleNewConversation = async () => {
     try {
-      setLoading(true);
-      const result = await api.uploadFile(file, undefined);
-      if (result.success) {
-        showToast(`Uploaded ${file.name}`, 'success');
-        // Send a message with the file reference
-        if (currentConversationId) {
-          await api.sendMessage(currentConversationId, `[Uploaded file: ${file.name}]`);
-          await loadMessages();
-        }
-      }
-    } catch (e) {
-      showToast(`Upload failed: ${(e as Error).message}`, 'error');
-    } finally {
-      setLoading(false);
+      const conv = await api.createConversation();
+      setCurrentConversation(conv.id, conv.cellId ?? null);
+      setConversations([conv, ...conversations]);
+      setMessages([]);
+    } catch {
+      addToast('Failed to create conversation', 'error');
     }
   };
 
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
+  const handleFileDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setDragActive(false);
-    const files = Array.from(e.dataTransfer.files);
-    for (const file of files) {
-      await handleFileUpload(file);
+    const droppedFiles = Array.from(e.dataTransfer.files);
+    for (const file of droppedFiles) {
+      try {
+        await api.uploadFile(file, currentCellId ?? undefined);
+        addToast(`Uploaded: ${file.name}`, 'success');
+      } catch (err: any) {
+        addToast(`Upload failed: ${file.name}`, 'error');
+      }
     }
-  }, [currentConversationId]);
-
-  const handleNewConversation = async () => {
-    const { conversation, cellId } = await api.createConversation('New Chat');
-    setCurrentConversation(conversation.id, cellId);
-    setMessages([]);
-    await loadConversations();
-    setShowConvList(false);
   };
 
-  const pendingTasks = tasks.filter(t => t.status === 'awaiting_user_action');
+  // Find HITL tasks for this conversation/cell
+  const hitlTasks = tasks.filter(t =>
+    t.status === 'awaiting_user_action' && t.cellId === currentCellId
+  );
 
   return (
-    <div className="flex flex-col h-full"
+    <div
+      className="h-full flex flex-col"
       onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
-      onDragLeave={() => setDragActive(false)}
-      onDrop={handleDrop}
+      onDragLeave={(e) => { e.preventDefault(); if (e.currentTarget === e.target) setDragActive(false); }}
+      onDrop={handleFileDrop}
     >
       {/* Header */}
-      <div className="h-14 px-6 flex items-center border-b border-border bg-bg-card/50 gap-3">
-        <button onClick={() => setShowConvList(!showConvList)}
-          className="text-lg hover:bg-bg-hover rounded-lg p-1.5 transition">💬</button>
-        <h2 className="font-semibold flex-1">
-          {conversations.find(c => c.id === currentConversationId)?.cellName || 'Agent Chat'}
-        </h2>
-        <button onClick={handleNewConversation}
-          className="px-3 py-1.5 text-sm bg-accent hover:bg-accent-hover text-white rounded-lg transition">
-          + New
+      <header className="flex items-center justify-between px-4 h-14 border-b border-border shrink-0 bg-bg-card">
+        <div className="flex items-center gap-3">
+          <h2 className="text-sm font-medium text-fg">
+            {currentConversationId ? 'Chat' : 'No conversation selected'}
+          </h2>
+        </div>
+        <button
+          onClick={handleNewConversation}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-bg-hover hover:bg-border text-fg-muted rounded-lg transition-colors"
+        >
+          <MessageSquarePlus className="w-3.5 h-3.5" />
+          New
         </button>
-      </div>
+      </header>
 
-      <div className="flex flex-1 overflow-hidden">
-        {/* Conversation Sidebar */}
-        {showConvList && (
-          <div className="w-64 border-r border-border bg-bg-card/50 overflow-y-auto">
-            {conversations.map((conv) => (
-              <button key={conv.id}
-                onClick={() => { setCurrentConversation(conv.id, conv.cellId); setShowConvList(false); }}
-                className={`w-full px-4 py-3 text-left text-sm border-b border-border hover:bg-bg-hover transition
-                  ${conv.id === currentConversationId ? 'bg-accent/10 border-l-2 border-l-accent' : ''}`}>
-                <div className="font-medium truncate">{conv.cellName || 'Untitled'}</div>
-                <div className="text-xs text-fg-muted">{new Date(conv.createdAt).toLocaleDateString()}</div>
-              </button>
-            ))}
+      {/* Conversation list (horizontal tabs when there are multiple) */}
+      {conversations.length > 1 && (
+        <div className="flex gap-1 px-3 py-2 border-b border-border overflow-x-auto bg-bg">
+          {conversations.slice(0, 10).map(conv => (
+            <button
+              key={conv.id}
+              onClick={() => setCurrentConversation(conv.id, conv.cellId)}
+              className={`px-3 py-1 rounded-lg text-xs whitespace-nowrap transition-colors ${
+                conv.id === currentConversationId
+                  ? 'bg-accent/10 text-accent'
+                  : 'text-fg-muted hover:bg-bg-hover'
+              }`}
+            >
+              {new Date(conv.createdAt).toLocaleDateString()}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Messages */}
+      <div className={`flex-1 overflow-y-auto px-4 py-4 ${dragActive ? 'ring-2 ring-accent ring-inset rounded-lg' : ''}`}>
+        {messages.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-fg-dim">
+            <MessageSquarePlus className="w-10 h-10 mb-3 opacity-40" />
+            <p className="text-sm">Start a conversation</p>
+            <p className="text-xs mt-1">Type a message or drag and drop a file</p>
           </div>
+        ) : (
+          <>
+            {messages.map(msg => (
+              <MessageBubble
+                key={msg.id}
+                role={msg.role}
+                content={msg.content}
+                createdAt={msg.createdAt}
+                citations={msg.metadata?.citations}
+                reactions={msg.metadata?.reactions}
+              />
+            ))}
+
+            {/* Inline approval cards */}
+            {hitlTasks.map(task => (
+              <ApprovalCard
+                key={task.id}
+                taskId={task.id}
+                title={task.title}
+                whyHuman={task.actionContext?.whyHuman}
+                draftContent={task.actionContext?.draftContent}
+                draftType={task.actionContext?.draftType}
+              />
+            ))}
+
+            <div ref={messagesEndRef} />
+          </>
         )}
 
-        {/* Messages */}
-        <div className={`flex-1 flex flex-col ${dragActive ? 'bg-accent/5 border-2 border-dashed border-accent' : ''}`}>
-          <div className="flex-1 overflow-y-auto px-6 py-4">
-            {messages.length === 0 && !loading && (
-              <div className="text-center mt-16">
-                <p className="text-4xl mb-4">🧠</p>
-                <p className="text-fg-muted">Send a message to start chatting with the agent</p>
-                <p className="text-xs text-fg-muted mt-2">Drop files here to upload</p>
-              </div>
-            )}
-
-            {messages.map((msg) => (
-              <MessageBubble key={msg.id} role={msg.role} content={msg.content} createdAt={msg.createdAt} />
-            ))}
-
-            {pendingTasks.map((task) => (
-              <ApprovalCard key={task.id} task={task as any} onAction={loadTasks} />
-            ))}
-
-            {loading && (
-              <div className="flex justify-start mb-3">
-                <div className="bg-bg-card border border-border rounded-2xl rounded-bl-md px-4 py-3 text-fg-muted animate-pulse">
-                  Thinking...
-                </div>
-              </div>
-            )}
-            <div ref={bottomRef} />
-          </div>
-
-          {/* Input */}
-          <div className="p-4 border-t border-border bg-bg-card/50">
-            <div className="flex gap-3 items-center">
-              <button onClick={() => fileInputRef.current?.click()}
-                className="p-2.5 text-fg-muted hover:text-fg hover:bg-bg-hover rounded-lg transition" title="Attach file">
-                📎
-              </button>
-              <input ref={fileInputRef} type="file" className="hidden"
-                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])} />
-              <input
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Message the agent... (Enter to send)"
-                className="flex-1 px-4 py-3 bg-bg rounded-xl border border-border text-fg focus:border-accent outline-none"
-              />
-              <button
-                onClick={handleSend}
-                disabled={loading || !input.trim()}
-                className="px-6 py-3 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-xl font-medium transition"
-              >
-                Send
-              </button>
+        {dragActive && (
+          <div className="absolute inset-0 flex items-center justify-center bg-bg/80 backdrop-blur-sm z-10">
+            <div className="flex flex-col items-center gap-2 text-accent">
+              <Paperclip className="w-8 h-8" />
+              <span className="text-sm font-medium">Drop files to upload</span>
             </div>
           </div>
-        </div>
+        )}
       </div>
 
-      {/* Toast */}
-      {toast && <Toast message={toast.message} type={toast.type} />}
+      {/* Input */}
+      <div className="px-4 pb-4 pt-2 border-t border-border bg-bg">
+        <div className="flex items-end gap-2 bg-bg-card border border-border rounded-xl px-3 py-2 focus-within:border-accent transition-colors">
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Type a message... (Shift+Enter for new line)"
+            rows={1}
+            className="flex-1 bg-transparent text-fg text-sm placeholder:text-fg-dim resize-none outline-none max-h-32"
+            style={{ minHeight: '24px' }}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!input.trim() || sending}
+            className="p-1.5 rounded-lg bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed shrink-0"
+          >
+            <Send className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

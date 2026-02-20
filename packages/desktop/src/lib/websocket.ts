@@ -1,11 +1,9 @@
 import { useStore } from './store';
 import { updateTrayBadge, showNativeNotification } from './native';
 import { replayQueue, enqueueMessage } from './offline-queue';
-import { api } from './api';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let isConnected = false;
 
 type MessageHandler = (data: any) => void;
 const handlers: MessageHandler[] = [];
@@ -19,22 +17,28 @@ export function onMessage(handler: MessageHandler) {
 }
 
 export function getConnectionStatus(): boolean {
-  return isConnected;
+  return useStore.getState().isConnected;
 }
 
 export function connectWebSocket() {
   const token = useStore.getState().token;
   if (!token) return;
 
+  // Don't create duplicate connections
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
   const wsUrl = (import.meta.env.VITE_API_URL || 'http://localhost:3001').replace('http', 'ws');
   ws = new WebSocket(`${wsUrl}/api/ws`);
 
   ws.onopen = () => {
     console.log('[WS] Connected');
-    isConnected = true;
+    useStore.getState().setConnected(true);
     ws?.send(JSON.stringify({ type: 'auth', token }));
 
     // Replay any queued offline messages
+    const { api } = require('./api');
     replayQueue(async (convId, content) => {
       await api.sendMessage(convId, content);
     }).then(({ sent, failed }) => {
@@ -51,23 +55,22 @@ export function connectWebSocket() {
       }
 
       // Notification for HITL tasks
-      if (data.type === 'notification' || data.type === 'task_update') {
-        const payload = data.payload;
-        if (payload?.status === 'awaiting_user_action') {
-          showNativeNotification(
-            'Action Required',
-            payload.title || 'A task needs your review'
-          );
-        }
+      if (data.type === 'task_update' && data.payload?.status === 'awaiting_user_action') {
+        showNativeNotification(
+          'Action Required',
+          data.payload.title || 'A task needs your review'
+        );
       }
 
-      if (data.type === 'task_update' || data.type === 'task_approved' || data.type === 'task_rejected') {
-        import('./api').then(({ api }) => api.getTasks().then(tasks => {
-          useStore.getState().setTasks(tasks);
-          // Update tray badge with pending count
-          const pending = tasks.filter((t: any) => t.status === 'awaiting_user_action').length;
-          updateTrayBadge(pending);
-        }));
+      if (['task_update', 'task_approved', 'task_rejected', 'tasks_created'].includes(data.type)) {
+        // Refresh tasks from the API - use dynamic import to avoid circular dep
+        import('./api').then(({ api }) => {
+          api.getTasks().then((tasks: any[]) => {
+            useStore.getState().setTasks(tasks);
+            const pending = tasks.filter(t => t.status === 'awaiting_user_action').length;
+            updateTrayBadge(pending);
+          }).catch(() => {});
+        });
       }
 
       handlers.forEach(h => h(data));
@@ -77,28 +80,31 @@ export function connectWebSocket() {
   };
 
   ws.onclose = () => {
-    console.log('[WS] Disconnected, reconnecting in 3s...');
-    isConnected = false;
+    console.log('[WS] Disconnected');
+    useStore.getState().setConnected(false);
+    // Clear any existing timer before setting a new one
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectWebSocket, 3000);
   };
 
   ws.onerror = () => ws?.close();
 }
 
-// Send message with offline fallback
 export function sendWSMessage(type: string, payload: any) {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type, ...payload }));
   } else if (type === 'message' && payload.content && payload.conversationId) {
-    // Queue for offline replay
     enqueueMessage(payload.conversationId, payload.content);
     console.log('[WS] Message queued for offline replay');
   }
 }
 
 export function disconnectWebSocket() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   ws?.close();
   ws = null;
-  isConnected = false;
+  useStore.getState().setConnected(false);
 }

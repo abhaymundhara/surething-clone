@@ -1,28 +1,35 @@
 import { SignJWT, jwtVerify } from 'jose';
 import { hash, verify } from './password.js';
 
-const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'dev-secret-change-me');
-const JWT_ISSUER = 'surething-clone';
-const JWT_EXPIRY = '7d';
-
-export interface JWTPayload {
-  sub: string; // userId
-  email: string;
+const JWT_SECRET_RAW = process.env.JWT_SECRET;
+if (!JWT_SECRET_RAW || JWT_SECRET_RAW === 'change-this-to-a-random-secret') {
+  console.warn('[Auth] WARNING: JWT_SECRET is not set or is using the default value. Set a strong random secret in .env');
 }
 
-export async function createToken(userId: string, email: string): Promise<string> {
-  return new SignJWT({ email })
+const JWT_SECRET = new TextEncoder().encode(JWT_SECRET_RAW || 'dev-secret-change-me');
+const JWT_ISSUER = 'surething-clone';
+const JWT_AUDIENCE = 'surething-clone';
+
+export async function createToken(userId: string): Promise<string> {
+  return new SignJWT({ sub: userId })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setIssuer(JWT_ISSUER)
-    .setSubject(userId)
-    .setExpirationTime(JWT_EXPIRY)
+    .setAudience(JWT_AUDIENCE)
+    .setExpirationTime('24h')
     .sign(JWT_SECRET);
 }
 
-export async function verifyToken(token: string): Promise<JWTPayload> {
-  const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
-  return { sub: payload.sub as string, email: payload.email as string };
+export async function verifyToken(token: string): Promise<{ sub: string } | null> {
+  try {
+    const { payload } = await jwtVerify(token, JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    return payload as { sub: string };
+  } catch {
+    return null;
+  }
 }
 
-export { hash as hashPassword, verify as verifyPassword };
+export { hash, verify };

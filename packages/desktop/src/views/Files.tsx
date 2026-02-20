@@ -1,63 +1,143 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useEffect, useState } from 'react';
+import { useStore } from '../lib/store';
 import { api } from '../lib/api';
+import { Upload, FileText, Image, File, Loader2, Trash2, Search } from 'lucide-react';
+
+interface FileItem {
+  id: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  createdAt: string;
+  analysisResult?: any;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function getFileIcon(mimeType: string) {
+  if (mimeType.startsWith('image/')) return Image;
+  if (mimeType.startsWith('text/') || mimeType.includes('json')) return FileText;
+  return File;
+}
 
 export default function Files() {
-  const [files, setFiles] = useState<any[]>([]);
-  const [dragging, setDragging] = useState(false);
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [analyzing, setAnalyzing] = useState<string | null>(null);
+  const { currentCellId, addToast } = useStore();
 
-  useEffect(() => { loadFiles(); }, []);
-
-  const loadFiles = async () => {
-    try { setFiles(await api.getFiles()); } catch (e) { console.error(e); }
+  const loadFiles = () => {
+    api.getFiles(currentCellId ?? undefined)
+      .then(f => { setFiles(f); setLoading(false); })
+      .catch(() => { addToast('Failed to load files', 'error'); setLoading(false); });
   };
 
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    const items = Array.from(e.dataTransfer.files);
-    for (const file of items) {
-      await api.uploadFile(file);
-    }
-    await loadFiles();
-  }, []);
+  useEffect(() => { loadFiles(); }, [currentCellId]);
 
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / 1048576).toFixed(1)} MB`;
+  const handleUpload = async (fileList: FileList | null) => {
+    if (!fileList) return;
+    setUploading(true);
+    const results = { success: 0, failed: 0 };
+
+    for (const file of Array.from(fileList)) {
+      try {
+        await api.uploadFile(file, currentCellId ?? undefined);
+        results.success++;
+      } catch {
+        results.failed++;
+      }
+    }
+
+    setUploading(false);
+    if (results.success > 0) addToast(`Uploaded ${results.success} file(s)`, 'success');
+    if (results.failed > 0) addToast(`${results.failed} upload(s) failed`, 'error');
+    loadFiles();
+  };
+
+  const handleAnalyze = async (fileId: string) => {
+    setAnalyzing(fileId);
+    try {
+      const result = await api.analyzeFile(fileId);
+      addToast('Analysis complete', 'success');
+      loadFiles(); // Refresh to show analysis
+    } catch {
+      addToast('Analysis failed', 'error');
+    } finally {
+      setAnalyzing(null);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    handleUpload(e.dataTransfer.files);
   };
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="h-14 px-6 flex items-center border-b border-border bg-bg-card/50">
-        <h2 className="font-semibold">Files</h2>
-        <span className="ml-auto text-sm text-fg-muted">{files.length} file(s)</span>
-      </div>
+    <div className="h-full flex flex-col">
+      <header className="flex items-center justify-between px-4 h-14 border-b border-border bg-bg-card shrink-0">
+        <h2 className="text-sm font-medium text-fg">Files</h2>
+        <label className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer transition-colors">
+          <Upload className="w-3.5 h-3.5" />
+          Upload
+          <input type="file" multiple className="hidden" onChange={e => handleUpload(e.target.files)} />
+        </label>
+      </header>
 
       <div
-        className={`flex-1 overflow-y-auto px-6 py-4 ${dragging ? 'bg-accent/10 border-2 border-dashed border-accent' : ''}`}
-        onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-        onDragLeave={() => setDragging(false)}
+        className="flex-1 overflow-y-auto"
+        onDragOver={e => e.preventDefault()}
         onDrop={handleDrop}
       >
-        {files.length === 0 && (
-          <div className="text-center mt-16">
-            <p className="text-4xl mb-4">📁</p>
-            <p className="text-fg-muted">Drop files here or use the chat to upload</p>
+        {loading ? (
+          <div className="flex items-center justify-center h-40">
+            <Loader2 className="w-5 h-5 text-fg-muted animate-spin" />
+          </div>
+        ) : files.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full text-fg-dim">
+            <Upload className="w-10 h-10 mb-3 opacity-40" />
+            <p className="text-sm">No files yet</p>
+            <p className="text-xs mt-1">Upload files or drag and drop them here</p>
+          </div>
+        ) : (
+          <div className="divide-y divide-border">
+            {files.map(file => {
+              const Icon = getFileIcon(file.mimeType);
+              return (
+                <div key={file.id} className="flex items-center gap-3 px-4 py-3 hover:bg-bg-hover/50 transition-colors group">
+                  <Icon className="w-5 h-5 text-fg-muted shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-fg truncate">{file.filename}</p>
+                    <p className="text-[11px] text-fg-dim">
+                      {formatSize(file.size)} · {file.mimeType} · {new Date(file.createdAt).toLocaleDateString()}
+                    </p>
+                    {file.analysisResult && (
+                      <p className="text-xs text-fg-muted mt-1 line-clamp-2">
+                        {file.analysisResult.analysis}
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => handleAnalyze(file.id)}
+                    disabled={analyzing === file.id}
+                    className="opacity-0 group-hover:opacity-100 p-1.5 text-fg-muted hover:text-accent transition-all"
+                    title="Analyze with AI"
+                  >
+                    {analyzing === file.id ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Search className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
-        <div className="grid gap-3">
-          {files.map((file: any) => (
-            <div key={file.id} className="bg-bg-card border border-border rounded-xl p-4 flex items-center gap-3">
-              <span className="text-2xl">📄</span>
-              <div className="flex-1 min-w-0">
-                <p className="font-medium truncate">{file.filename}</p>
-                <p className="text-xs text-fg-muted">{file.mimeType} · {formatSize(file.sizeBytes)}</p>
-              </div>
-              <span className="text-xs text-fg-muted">{new Date(file.createdAt).toLocaleDateString()}</span>
-            </div>
-          ))}
-        </div>
       </div>
     </div>
   );

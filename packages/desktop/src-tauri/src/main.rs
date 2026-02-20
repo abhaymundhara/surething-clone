@@ -3,7 +3,7 @@
 
 use tauri::{
     Manager,
-    menu::{Menu, MenuItem},
+    menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
@@ -16,13 +16,14 @@ fn update_tray_badge(app: tauri::AppHandle, count: u32) -> Result<(), String> {
         "SureThing Clone".to_string()
     };
     tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())?;
+
     // On macOS, set the badge text on the dock icon
     #[cfg(target_os = "macos")]
     {
         if count > 0 {
-            app.set_badge_label(Some(count.to_string()));
+            let _ = app.set_badge_label(Some(count.to_string()));
         } else {
-            app.set_badge_label(None);
+            let _ = app.set_badge_label(None::<String>);
         }
     }
     Ok(())
@@ -54,16 +55,20 @@ fn main() {
             show_notification,
         ])
         .setup(|app| {
-            // Build system tray
-            let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            // Build tray menu using Tauri 2 builder API
+            let show_item = MenuItemBuilder::with_id("show", "Show Window").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
 
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .tooltip("SureThing Clone")
                 .menu(&menu)
                 .menu_on_left_click(false)
-                .on_menu_event(move |app, event| match event.id.as_ref() {
+                .on_menu_event(move |app, event| match event.id().as_ref() {
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();

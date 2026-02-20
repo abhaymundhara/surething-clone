@@ -1,13 +1,11 @@
-import { createHash, randomBytes } from 'crypto';
+import bcrypt from 'bcryptjs';
 
-export function hash(password: string): string {
-  const salt = randomBytes(16).toString('hex');
-  const hashed = createHash('sha256').update(password + salt).digest('hex');
-  return `${salt}:${hashed}`;
+const SALT_ROUNDS = 12;
+
+export async function hash(password: string): Promise<string> {
+  return bcrypt.hash(password, SALT_ROUNDS);
 }
 
-export function verify(password: string, stored: string): boolean {
-  const [salt, hash] = stored.split(':');
-  const hashed = createHash('sha256').update(password + salt).digest('hex');
-  return hashed === hash;
+export async function verify(password: string, hashed: string): Promise<boolean> {
+  return bcrypt.compare(password, hashed);
 }

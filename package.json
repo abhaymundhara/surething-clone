@@ -2,19 +2,18 @@
   "name": "surething-clone",
   "private": true,
   "scripts": {
-    "dev": "turbo dev",
-    "build": "turbo build",
-    "db:generate": "turbo db:generate --filter=@surething/server",
-    "db:migrate": "turbo db:migrate --filter=@surething/server",
-    "db:studio": "turbo db:studio --filter=@surething/server",
-    "test": "turbo test"
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "db:push": "cd packages/server && npx drizzle-kit push",
+    "db:generate": "cd packages/server && npx drizzle-kit generate",
+    "db:migrate": "cd packages/server && npx tsx src/db/migrate.ts",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
   },
   "devDependencies": {
     "turbo": "^2.3.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.6.0"
   },
-  "packageManager": "pnpm@9.15.0",
-  "engines": {
-    "node": ">=22.0.0"
-  }
+  "packageManager": "pnpm@9.0.0"
 }

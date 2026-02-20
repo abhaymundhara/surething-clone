@@ -1,206 +1,186 @@
 import { db } from '../db/index.js';
-import { tasks, taskRuns, cells } from '../db/schema.js';
-import { eq, and } from 'drizzle-orm';
-import { taskQueue, heartbeatQueue, createTaskWorker, createHeartbeatWorker } from '../lib/queue.js';
-import { runConductor, type Signal } from './conductor.js';
-import { runHeartbeat } from './heartbeat.js';
+import { tasks, taskRuns, drafts } from '../db/schema.js';
+import { eq, and, inArray } from 'drizzle-orm';
+import { taskQueue, Worker, redis } from '../lib/queue.js';
+import { runConductor } from './conductor.js';
 import { broadcast } from '../lib/websocket.js';
 import { logAgentAction } from '../services/agent-log.js';
-import type { Job } from 'bullmq';
 
 // ═══════════════════════════════════════════════════════
-// TASK SCHEDULER — BullMQ integration
+// TASK SCHEDULER — BullMQ-based task scheduling
+// Handles delay (one-time) and cron (recurring) tasks
 // ═══════════════════════════════════════════════════════
 
 export async function scheduleTask(taskId: string): Promise<void> {
-  const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
-  if (!task || !task.triggerType) return;
+  const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1);
+  if (!task) throw new Error(`Task ${taskId} not found`);
 
-  const config = task.triggerConfig as Record<string, unknown>;
+  const triggerConfig = task.triggerConfig as Record<string, any> | null;
+  if (!triggerConfig || !task.triggerType) return;
+
+  const jobData = { taskId, userId: task.userId, cellId: task.cellId };
 
   if (task.triggerType === 'delay') {
-    const delay = config.delay as { value: number; unit: string };
-    let ms = delay.value;
-    if (delay.unit === 'minutes') ms *= 60_000;
-    else if (delay.unit === 'hours') ms *= 3_600_000;
-    else if (delay.unit === 'days') ms *= 86_400_000;
-
-    await taskQueue.add('execute-task', { taskId }, {
+    const delay = triggerConfig.delay;
+    if (!delay?.value || !delay?.unit) {
+      throw new Error(`Invalid delay config for task ${taskId}`);
+    }
+    const ms = toMilliseconds(delay.value, delay.unit);
+    await taskQueue.add(`task:${taskId}`, jobData, {
       delay: ms,
-      jobId: `task-${taskId}`,
+      jobId: `delay-${taskId}`,
       removeOnComplete: true,
+      removeOnFail: 5,
     });
-    console.log(`[Scheduler] Delayed task ${taskId} by ${delay.value} ${delay.unit}`);
-  }
+    console.log(`[Scheduler] Scheduled delay task ${taskId}: ${delay.value} ${delay.unit}`);
 
-  if (task.triggerType === 'cron') {
-    const expression = config.expression as string;
-    const timezone = (config as Record<string, string>).timezone || 'UTC';
-
-    await taskQueue.upsertJobScheduler(
-      `cron-${taskId}`,
-      { pattern: expression, tz: timezone },
-      { name: 'execute-task', data: { taskId } }
-    );
-    console.log(`[Scheduler] Cron task ${taskId}: ${expression} (${timezone})`);
+  } else if (task.triggerType === 'cron') {
+    const expression = triggerConfig.expression;
+    const timezone = triggerConfig.timezone || 'UTC';
+    if (!expression) {
+      throw new Error(`Invalid cron config for task ${taskId}`);
+    }
+    await taskQueue.add(`task:${taskId}`, jobData, {
+      repeat: {
+        pattern: expression,
+        tz: timezone,
+      },
+      jobId: `cron-${taskId}`,
+      removeOnComplete: true,
+      removeOnFail: 5,
+    });
+    console.log(`[Scheduler] Scheduled cron task ${taskId}: ${expression} (${timezone})`);
   }
 }
 
 export async function cancelScheduledTask(taskId: string): Promise<void> {
   try {
-    const job = await taskQueue.getJob(`task-${taskId}`);
-    if (job) await job.remove();
-    await taskQueue.removeJobScheduler(`cron-${taskId}`);
-    console.log(`[Scheduler] Cancelled scheduled task ${taskId}`);
+    // Remove delayed job
+    const delayedJob = await taskQueue.getJob(`delay-${taskId}`);
+    if (delayedJob) {
+      await delayedJob.remove();
+      console.log(`[Scheduler] Removed delayed job for task ${taskId}`);
+    }
+
+    // Remove repeatable (cron) jobs
+    const repeatableJobs = await taskQueue.getRepeatableJobs();
+    for (const job of repeatableJobs) {
+      if (job.id === `cron-${taskId}` || job.name === `task:${taskId}`) {
+        await taskQueue.removeRepeatableByKey(job.key);
+        console.log(`[Scheduler] Removed repeatable job for task ${taskId}`);
+      }
+    }
   } catch (e) {
-    console.warn(`[Scheduler] Cancel failed for ${taskId}:`, (e as Error).message);
+    console.warn(`[Scheduler] Failed to cancel task ${taskId}:`, (e as Error).message);
   }
 }
 
-// ─── Task Worker ─────────────────────────────────────────
-
-async function processTaskJob(job: Job): Promise<void> {
-  const { taskId } = job.data;
-  console.log(`[Scheduler] Executing task ${taskId}`);
-
-  const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
-  if (!task) {
-    console.warn(`[Scheduler] Task ${taskId} not found`);
-    return;
+function toMilliseconds(value: number, unit: string): number {
+  switch (unit) {
+    case 'minutes': return value * 60 * 1000;
+    case 'hours': return value * 60 * 60 * 1000;
+    case 'days': return value * 24 * 60 * 60 * 1000;
+    default: return value * 60 * 1000; // default to minutes
   }
+}
 
-  // CRITICAL: For recurring tasks, skip if paused but NEVER mark completed/failed/skipped
-  if (task.triggerType === 'cron' && task.status === 'paused') {
-    console.log(`[Scheduler] Cron task ${taskId} is paused, skipping this run`);
-    return;
-  }
+// ─── Task Worker ─────────────────────────────
+export function startTaskWorker() {
+  const worker = new Worker('tasks', async (job) => {
+    const { taskId, userId, cellId } = job.data;
+    console.log(`[TaskWorker] Processing task ${taskId}`);
 
-  // For non-recurring: skip if already terminal
-  if (task.triggerType !== 'cron' && ['completed', 'failed', 'skipped'].includes(task.status)) {
-    console.log(`[Scheduler] Task ${taskId} already ${task.status}, skipping`);
-    return;
-  }
+    try {
+      const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1);
+      if (!task) {
+        console.warn(`[TaskWorker] Task ${taskId} not found, skipping`);
+        return;
+      }
 
-  const [cell] = await db.select().from(cells).where(eq(cells.id, task.cellId));
-  if (!cell) return;
+      // Skip if task has been paused/skipped/completed
+      if (['paused', 'skipped', 'completed', 'failed'].includes(task.status)) {
+        console.log(`[TaskWorker] Task ${taskId} is ${task.status}, skipping execution`);
+        return;
+      }
 
-  // Create task run record
-  const [run] = await db.insert(taskRuns).values({
-    taskId,
-    status: 'running',
-  }).returning();
+      // Update status to in_progress
+      await db.update(tasks)
+        .set({ status: 'in_progress', updatedAt: new Date() })
+        .where(eq(tasks.id, taskId));
 
-  // Log the scheduled execution
-  await logAgentAction(cell.userId, task.cellId, 'schedule_triggered', {
-    taskId, title: task.title, triggerType: task.triggerType,
+      // Log the run
+      const [run] = await db.insert(taskRuns).values({
+        taskId,
+        status: 'running',
+        startedAt: new Date(),
+      }).returning();
+
+      // Execute via conductor
+      const result = await runConductor({
+        type: 'timer',
+        userId,
+        cellId,
+        content: task.action || `Execute task: ${task.title}`,
+        metadata: { taskId, runId: run.id },
+      });
+
+      // Update run as successful
+      await db.update(taskRuns)
+        .set({
+          status: 'completed',
+          completedAt: new Date(),
+          result: { response: result.response, toolsUsed: result.toolsUsed },
+        })
+        .where(eq(taskRuns.id, run.id));
+
+      // For non-recurring tasks, mark as completed
+      if (task.triggerType !== 'cron' && task.triggerType !== 'event') {
+        await db.update(tasks)
+          .set({ status: 'completed', updatedAt: new Date() })
+          .where(eq(tasks.id, taskId));
+      } else {
+        // Recurring: reset to pending for next execution
+        await db.update(tasks)
+          .set({ status: 'pending', updatedAt: new Date() })
+          .where(eq(tasks.id, taskId));
+      }
+
+      broadcast(userId, { type: 'task_update', payload: { taskId, status: 'completed' } });
+
+      await logAgentAction(userId, cellId, 'execute_task', {
+        taskId,
+        runId: run.id,
+        title: task.title,
+        success: true,
+      });
+
+    } catch (e) {
+      console.error(`[TaskWorker] Task ${taskId} failed:`, (e as Error).message);
+
+      // Update task status
+      await db.update(tasks)
+        .set({ status: 'failed', updatedAt: new Date() })
+        .where(eq(tasks.id, taskId));
+
+      broadcast(userId, { type: 'task_update', payload: { taskId, status: 'failed', error: (e as Error).message } });
+    }
+  }, {
+    connection: redis,
+    concurrency: 3,
+    limiter: {
+      max: 10,
+      duration: 60000, // Max 10 tasks per minute
+    },
   });
 
-  // Update task status (only for non-cron)
-  if (task.triggerType !== 'cron') {
-    await db.update(tasks).set({ status: 'in_progress' }).where(eq(tasks.id, taskId));
-  }
-
-  try {
-    if (task.executor === 'human') {
-      await db.update(tasks).set({ status: 'awaiting_user_action' }).where(eq(tasks.id, taskId));
-      broadcast(cell.userId, { type: 'task_update', payload: { ...task, status: 'awaiting_user_action' } });
-      await db.update(taskRuns).set({ status: 'waiting_human', completedAt: new Date() }).where(eq(taskRuns.id, run.id));
-      return;
-    }
-
-    // AI tasks: run through conductor
-    const signal: Signal = {
-      type: 'timer',
-      userId: cell.userId,
-      cellId: task.cellId,
-      conversationId: task.conversationId || undefined,
-      content: task.action || `Execute task: ${task.title}`,
-    };
-
-    const result = await runConductor(signal);
-
-    // CRITICAL: NEVER mark cron tasks as completed — they run forever until paused
-    if (task.triggerType !== 'cron') {
-      await db.update(tasks).set({ status: 'completed', completedAt: new Date() }).where(eq(tasks.id, taskId));
-    }
-
-    await db.update(taskRuns).set({
-      status: 'completed',
-      result: { response: result.response, toolsUsed: result.toolsUsed },
-      completedAt: new Date(),
-    }).where(eq(taskRuns.id, run.id));
-
-    if (task.triggerType !== 'cron') {
-      broadcast(cell.userId, { type: 'task_update', payload: { ...task, status: 'completed' } });
-    }
-
-    await logAgentAction(cell.userId, task.cellId, 'task_completed', { taskId, title: task.title });
-
-  } catch (e) {
-    console.error(`[Scheduler] Task ${taskId} failed:`, (e as Error).message);
-
-    // CRITICAL: NEVER mark cron tasks as failed
-    if (task.triggerType !== 'cron') {
-      await db.update(tasks).set({ status: 'failed' }).where(eq(tasks.id, taskId));
-    }
-    await db.update(taskRuns).set({
-      status: 'failed',
-      result: { error: (e as Error).message },
-      completedAt: new Date(),
-    }).where(eq(taskRuns.id, run.id));
-
-    await logAgentAction(cell.userId, task.cellId, 'error', { taskId, error: (e as Error).message });
-  }
-}
-
-// ─── Heartbeat Worker ────────────────────────────────────
-
-async function processHeartbeatJob(job: Job): Promise<void> {
-  const { cellId, userId } = job.data;
-  await logAgentAction(userId, cellId, 'heartbeat_check', { ruleId: job.data.ruleId });
-  await runHeartbeat(cellId, userId);
-}
-
-// ─── Initialize Workers ──────────────────────────────────
-
-export function initializeScheduler(): void {
-  const taskWorker = createTaskWorker(processTaskJob);
-  const heartbeatWorker = createHeartbeatWorker(processHeartbeatJob);
-
-  taskWorker.on('failed', (job, err) => {
-    console.error(`[Scheduler] Task job ${job?.id} failed:`, err.message);
+  worker.on('failed', (job, err) => {
+    console.error(`[TaskWorker] Job ${job?.id} failed:`, err.message);
   });
 
-  heartbeatWorker.on('failed', (job, err) => {
-    console.error(`[Scheduler] Heartbeat job ${job?.id} failed:`, err.message);
+  worker.on('error', (err) => {
+    console.error('[TaskWorker] Worker error:', err.message);
   });
 
-  console.log('[Scheduler] Task and heartbeat workers initialized');
-}
-
-// ─── Restore scheduled tasks on startup ──────────────────
-
-export async function restoreScheduledTasks(): Promise<void> {
-  const cronTasks = await db.select().from(tasks)
-    .where(and(
-      eq(tasks.triggerType, 'cron'),
-      eq(tasks.status, 'pending')
-    ));
-
-  for (const task of cronTasks) {
-    await scheduleTask(task.id);
-  }
-
-  // Also restore delayed tasks that haven't fired yet
-  const delayTasks = await db.select().from(tasks)
-    .where(and(
-      eq(tasks.triggerType, 'delay'),
-      eq(tasks.status, 'pending')
-    ));
-
-  for (const task of delayTasks) {
-    await scheduleTask(task.id);
-  }
-
-  console.log(`[Scheduler] Restored ${cronTasks.length} cron tasks + ${delayTasks.length} delayed tasks`);
+  console.log('[Scheduler] Task worker started');
+  return worker;
 }

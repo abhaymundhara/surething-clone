@@ -1,27 +1,22 @@
-import { Queue, Worker, Job } from 'bullmq';
+import { Queue, Worker, type Job } from 'bullmq';
 import IORedis from 'ioredis';
 
-const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
-// Task execution queue
-export const taskQueue = new Queue('tasks', { connection });
+export const redis = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null, // Required for BullMQ
+  retryStrategy: (times: number) => Math.min(times * 200, 5000),
+});
 
-// Heartbeat queue
-export const heartbeatQueue = new Queue('heartbeats', { connection });
+redis.on('error', (err) => {
+  console.error('[Redis] Connection error:', err.message);
+});
 
-export function createTaskWorker(handler: (job: Job) => Promise<void>): Worker {
-  return new Worker('tasks', handler, {
-    connection,
-    concurrency: 3,
-  });
-}
+redis.on('connect', () => {
+  console.log('[Redis] Connected');
+});
 
-export function createHeartbeatWorker(handler: (job: Job) => Promise<void>): Worker {
-  return new Worker('heartbeats', handler, {
-    connection,
-    concurrency: 1,
-  });
-}
+export const taskQueue = new Queue('tasks', { connection: redis });
+export const heartbeatQueue = new Queue('heartbeat', { connection: redis });
 
-export { connection as redisConnection };
+export { Queue, Worker, type Job };
