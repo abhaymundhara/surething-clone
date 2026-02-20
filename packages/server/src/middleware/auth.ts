@@ -14,6 +14,7 @@ export async function authMiddleware(c: Context, next: Next) {
     '/api/auth/register',
     '/api/connections/github/callback',
     '/api/health',
+    '/api/ws',
   ];
   if (publicPaths.some(p => path.startsWith(p))) {
     return next();

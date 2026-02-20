@@ -40,6 +40,7 @@ app.use('/api/*', async (c, next) => {
   if (path === '/api/health' || 
       path === '/api/auth/login' || 
       path === '/api/auth/register' ||
+      path === '/api/ws' ||
       path.startsWith('/api/webhooks/') ||
       path === '/api/connections/github/callback') {
     return next();

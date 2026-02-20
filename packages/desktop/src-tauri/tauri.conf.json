@@ -12,12 +12,16 @@
     "windows": [
       {
         "title": "SureThing Clone",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 800,
-        "minHeight": 600,
+        "label": "main",
+        "width": 800,
+        "height": 600,
+        "minWidth": 400,
+        "minHeight": 300,
         "resizable": true,
-        "decorations": true
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "titleBarStyle": "Overlay"
       }
     ],
     "security": {
@@ -36,19 +40,5 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {
-    "notification": {
-      "all": true
-    },
-    "shell": {
-      "open": true
-    },
-    "fs": {
-      "all": true,
-      "scope": [
-        "$HOME/**",
-        "$APPDATA/**"
-      ]
-    }
-  }
+  "plugins": {}
 }
