@@ -1,34 +1,41 @@
-import { useState, useEffect, useRef } from 'react';
-import { useStore } from '../lib/store';
-import { api } from '../lib/api';
-import MessageBubble from '../components/MessageBubble';
-import ApprovalCard from '../components/ApprovalCard';
-import { Send, Paperclip, Plus, MessageSquarePlus } from 'lucide-react';
+import { useState, useEffect, useRef } from "react";
+import { useStore } from "../lib/store";
+import { api } from "../lib/api";
+import MessageBubble from "../components/MessageBubble";
+import ApprovalCard from "../components/ApprovalCard";
+import { Send, Paperclip, Plus, MessageSquarePlus } from "lucide-react";
 
 export default function Chat() {
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const {
-    messages, setMessages, addMessage,
-    conversations, setConversations,
-    currentConversationId, currentCellId, setCurrentConversation,
-    tasks, addToast,
+    messages,
+    setMessages,
+    addMessage,
+    conversations,
+    setConversations,
+    currentConversationId,
+    currentCellId,
+    setCurrentConversation,
+    tasks,
+    addToast,
   } = useStore();
 
   // Load conversations on mount
   useEffect(() => {
-    api.getConversations()
-      .then(convs => {
+    api
+      .getConversations()
+      .then((convs) => {
         setConversations(convs);
         if (convs.length > 0 && !currentConversationId) {
           setCurrentConversation(convs[0].id, convs[0].cellId);
         }
       })
-      .catch(() => addToast('Failed to load conversations', 'error'));
+      .catch(() => addToast("Failed to load conversations", "error"));
   }, []);
 
   // Load messages when conversation changes
@@ -37,14 +44,15 @@ export default function Chat() {
       setMessages([]);
       return;
     }
-    api.getMessages(currentConversationId)
-      .then(msgs => setMessages(msgs))
-      .catch(() => addToast('Failed to load messages', 'error'));
+    api
+      .getMessages(currentConversationId)
+      .then((msgs) => setMessages(msgs))
+      .catch(() => addToast("Failed to load messages", "error"));
   }, [currentConversationId]);
 
   // Auto-scroll to bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   // Focus input
@@ -66,19 +74,19 @@ export default function Chat() {
         setCurrentConversation(conv.id, conv.cellId ?? null);
         setConversations([conv, ...conversations]);
       } catch {
-        addToast('Failed to create conversation', 'error');
+        addToast("Failed to create conversation", "error");
         return;
       }
     }
 
-    setInput('');
+    setInput("");
     setSending(true);
 
     // Optimistic message
     const tempMsg = {
       id: `temp-${Date.now()}`,
       conversationId: convId,
-      role: 'user' as const,
+      role: "user" as const,
       content: text,
       createdAt: new Date().toISOString(),
     };
@@ -89,18 +97,20 @@ export default function Chat() {
       // Server returns the saved message; the WS handler will also push it
       // The store's addMessage deduplicates by removing temp messages
     } catch (err: any) {
-      addToast(err.message || 'Failed to send message', 'error');
+      addToast(err.message || "Failed to send message", "error");
       // Remove the optimistic message on error
-      useStore.getState().setMessages(
-        useStore.getState().messages.filter(m => m.id !== tempMsg.id)
-      );
+      useStore
+        .getState()
+        .setMessages(
+          useStore.getState().messages.filter((m) => m.id !== tempMsg.id),
+        );
     } finally {
       setSending(false);
     }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
     }
@@ -113,7 +123,7 @@ export default function Chat() {
       setConversations([conv, ...conversations]);
       setMessages([]);
     } catch {
-      addToast('Failed to create conversation', 'error');
+      addToast("Failed to create conversation", "error");
     }
   };
 
@@ -124,30 +134,36 @@ export default function Chat() {
     for (const file of droppedFiles) {
       try {
         await api.uploadFile(file, currentCellId ?? undefined);
-        addToast(`Uploaded: ${file.name}`, 'success');
+        addToast(`Uploaded: ${file.name}`, "success");
       } catch (err: any) {
-        addToast(`Upload failed: ${file.name}`, 'error');
+        addToast(`Upload failed: ${file.name}`, "error");
       }
     }
   };
 
   // Find HITL tasks for this conversation/cell
-  const hitlTasks = tasks.filter(t =>
-    t.status === 'awaiting_user_action' && t.cellId === currentCellId
+  const hitlTasks = tasks.filter(
+    (t) => t.status === "awaiting_user_action" && t.cellId === currentCellId,
   );
 
   return (
     <div
       className="h-full flex flex-col"
-      onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
-      onDragLeave={(e) => { e.preventDefault(); if (e.currentTarget === e.target) setDragActive(false); }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragActive(true);
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        if (e.currentTarget === e.target) setDragActive(false);
+      }}
       onDrop={handleFileDrop}
     >
       {/* Header */}
       <header className="flex items-center justify-between px-4 h-14 border-b border-border shrink-0 bg-bg-card">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-medium text-fg">
-            {currentConversationId ? 'Chat' : 'No conversation selected'}
+            {currentConversationId ? "Chat" : "No conversation selected"}
           </h2>
         </div>
         <button
@@ -162,14 +178,14 @@ export default function Chat() {
       {/* Conversation list (horizontal tabs when there are multiple) */}
       {conversations.length > 1 && (
         <div className="flex gap-1 px-3 py-2 border-b border-border overflow-x-auto bg-bg">
-          {conversations.slice(0, 10).map(conv => (
+          {conversations.slice(0, 10).map((conv) => (
             <button
               key={conv.id}
               onClick={() => setCurrentConversation(conv.id, conv.cellId)}
               className={`px-3 py-1 rounded-lg text-xs whitespace-nowrap transition-colors ${
                 conv.id === currentConversationId
-                  ? 'bg-accent/10 text-accent'
-                  : 'text-fg-muted hover:bg-bg-hover'
+                  ? "bg-accent/10 text-accent"
+                  : "text-fg-muted hover:bg-bg-hover"
               }`}
             >
               {new Date(conv.createdAt).toLocaleDateString()}
@@ -179,16 +195,20 @@ export default function Chat() {
       )}
 
       {/* Messages */}
-      <div className={`flex-1 overflow-y-auto px-4 py-4 ${dragActive ? 'ring-2 ring-accent ring-inset rounded-lg' : ''}`}>
+      <div
+        className={`flex-1 overflow-y-auto px-4 py-4 ${dragActive ? "ring-2 ring-accent ring-inset rounded-lg" : ""}`}
+      >
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-fg-dim">
             <MessageSquarePlus className="w-10 h-10 mb-3 opacity-40" />
             <p className="text-sm">Start a conversation</p>
-            <p className="text-xs mt-1">Type a message or drag and drop a file</p>
+            <p className="text-xs mt-1">
+              Type a message or drag and drop a file
+            </p>
           </div>
         ) : (
           <>
-            {messages.map(msg => (
+            {messages.map((msg) => (
               <MessageBubble
                 key={msg.id}
                 role={msg.role}
@@ -200,7 +220,7 @@ export default function Chat() {
             ))}
 
             {/* Inline approval cards */}
-            {hitlTasks.map(task => (
+            {hitlTasks.map((task) => (
               <ApprovalCard
                 key={task.id}
                 taskId={task.id}
@@ -231,12 +251,12 @@ export default function Chat() {
           <textarea
             ref={inputRef}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Type a message... (Shift+Enter for new line)"
             rows={1}
             className="flex-1 bg-transparent text-fg text-sm placeholder:text-fg-dim resize-none outline-none max-h-32"
-            style={{ minHeight: '24px' }}
+            style={{ minHeight: "24px" }}
           />
           <button
             onClick={handleSend}
